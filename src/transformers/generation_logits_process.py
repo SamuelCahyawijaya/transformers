@@ -288,6 +288,10 @@ class NoRepeatNGramLogitsProcessor(LogitsProcessor):
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
         num_batch_hypotheses = scores.shape[0]
         cur_len = input_ids.shape[-1]
+        
+        bos_idx = (input_ids[0,:] - 50257).abs().argmax()
+        input_ids = input_ids[:,bos_idx:]
+        
         banned_batch_tokens = _calc_banned_ngram_tokens(self.ngram_size, input_ids, num_batch_hypotheses, cur_len)
 
         for i, banned_tokens in enumerate(banned_batch_tokens):
