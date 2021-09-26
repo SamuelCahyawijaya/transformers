@@ -14,13 +14,10 @@
 # limitations under the License
 """ Tokenization classes for IndoNLG model."""
 
-import os
-from shutil import copyfile
-from typing import List, Optional, Tuple
+from typing import List, Optional
 from transformers import PreTrainedTokenizer
 
 import sentencepiece as spm
-
 from transformers.utils import logging
 
 
