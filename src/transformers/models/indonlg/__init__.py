@@ -31,7 +31,7 @@ if is_sentencepiece_available():
 
 if TYPE_CHECKING:
     if is_sentencepiece_available():
-        from .tokenization_indonlg import IndoNLGTokenizers
+        from .tokenization_indonlg import IndoNLGTokenizer
 
 #     if is_tokenizers_available():
 #         from .tokenization_mbart50_fast import MBart50TokenizerFast
