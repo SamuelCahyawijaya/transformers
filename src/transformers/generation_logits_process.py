@@ -289,7 +289,7 @@ class NoRepeatNGramLogitsProcessor(LogitsProcessor):
         num_batch_hypotheses = scores.shape[0]
         cur_len = input_ids.shape[-1]
         
-        bos_idx = (input_ids[0,:] - 50257).abs().argmax()
+        bos_idx = (input_ids[0,:] - 50257).abs().argmin()
         input_ids = input_ids[:,bos_idx:]
         
         banned_batch_tokens = _calc_banned_ngram_tokens(self.ngram_size, input_ids, num_batch_hypotheses, cur_len)
