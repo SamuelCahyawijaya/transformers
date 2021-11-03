@@ -44,16 +44,14 @@ class {{cookiecutter.camelcase_modelname}}Config(PretrainedConfig):
             Vocabulary size of the {{cookiecutter.modelname}} model. Defines the number of different tokens that can be represented by the
             :obj:`inputs_ids` passed when calling :class:`~transformers.{{cookiecutter.camelcase_modelname}}Model` or
             :class:`~transformers.TF{{cookiecutter.camelcase_modelname}}Model`.
-            Vocabulary size of the  model. Defines the different tokens that
-            can be represented by the `inputs_ids` passed to the forward method of :class:`~transformers.{{cookiecutter.camelcase_modelname}}Model`.
         hidden_size (:obj:`int`, `optional`, defaults to 768):
-            Dimensionality of the encoder layers and the pooler layer.
+            Dimension of the encoder layers and the pooler layer.
         num_hidden_layers (:obj:`int`, `optional`, defaults to 12):
             Number of hidden layers in the Transformer encoder.
         num_attention_heads (:obj:`int`, `optional`, defaults to 12):
             Number of attention heads for each attention layer in the Transformer encoder.
         intermediate_size (:obj:`int`, `optional`, defaults to 3072):
-            Dimensionality of the "intermediate" (i.e., feed-forward) layer in the Transformer encoder.
+            Dimension of the "intermediate" (i.e., feed-forward) layer in the Transformer encoder.
         hidden_act (:obj:`str` or :obj:`function`, `optional`, defaults to :obj:`"gelu"`):
             The non-linear activation function (function or string) in the encoder and pooler.
             If string, :obj:`"gelu"`, :obj:`"relu"`, :obj:`"selu"` and :obj:`"gelu_new"` are supported.
@@ -74,15 +72,13 @@ class {{cookiecutter.camelcase_modelname}}Config(PretrainedConfig):
         use_cache (:obj:`bool`, `optional`, defaults to :obj:`True`):
             Whether or not the model should return the last key/values attentions (not used by all models). Only
             relevant if ``config.is_decoder=True``.
-        gradient_checkpointing (:obj:`bool`, `optional`, defaults to :obj:`False`):
-            If True, use gradient checkpointing to save memory at the expense of slower backward pass.
         {% else -%}
         vocab_size (:obj:`int`, `optional`, defaults to 50265):
             Vocabulary size of the {{cookiecutter.modelname}} model. Defines the number of different tokens that can be represented by the
             :obj:`inputs_ids` passed when calling :class:`~transformers.{{cookiecutter.camelcase_modelname}}Model` or
             :class:`~transformers.TF{{cookiecutter.camelcase_modelname}}Model`.
         d_model (:obj:`int`, `optional`, defaults to 1024):
-            Dimensionality of the layers and the pooler layer.
+            Dimension of the layers and the pooler layer.
         encoder_layers (:obj:`int`, `optional`, defaults to 12):
             Number of encoder layers.
         decoder_layers (:obj:`int`, `optional`, defaults to 12):
@@ -92,9 +88,9 @@ class {{cookiecutter.camelcase_modelname}}Config(PretrainedConfig):
         decoder_attention_heads (:obj:`int`, `optional`, defaults to 16):
             Number of attention heads for each attention layer in the Transformer decoder.
         decoder_ffn_dim (:obj:`int`, `optional`, defaults to 4096):
-            Dimensionality of the "intermediate" (often named feed-forward) layer in decoder.
+            Dimension of the "intermediate" (often named feed-forward) layer in decoder.
         encoder_ffn_dim (:obj:`int`, `optional`, defaults to 4096):
-            Dimensionality of the "intermediate" (often named feed-forward) layer in decoder.
+            Dimension of the "intermediate" (often named feed-forward) layer in decoder.
         activation_function (:obj:`str` or :obj:`function`, `optional`, defaults to :obj:`"gelu"`):
             The non-linear activation function (function or string) in the encoder and pooler. If string,
             :obj:`"gelu"`, :obj:`"relu"`, :obj:`"silu"` and :obj:`"gelu_new"` are supported.
@@ -139,6 +135,15 @@ class {{cookiecutter.camelcase_modelname}}Config(PretrainedConfig):
     {% else -%}
     keys_to_ignore_at_inference = ["past_key_values"]
     {% endif -%}
+    
+    {% if cookiecutter.is_encoder_decoder_model == "False" %}
+    {%- else %}
+    attribute_map = {
+        "num_attention_heads": "encoder_attention_heads",
+        "hidden_size": "d_model"
+    }
+
+    {%- endif %}
 
     def __init__(
         self,
@@ -179,25 +184,12 @@ class {{cookiecutter.camelcase_modelname}}Config(PretrainedConfig):
         decoder_start_token_id=2,
         classifier_dropout=0.0,
         scale_embedding=False,
-        gradient_checkpointing=False,
         {% endif -%}
         pad_token_id=1,
         bos_token_id=0,
         eos_token_id=2,
         **kwargs
     ):
-        super().__init__(
-            pad_token_id=pad_token_id,
-            bos_token_id=bos_token_id,
-            eos_token_id=eos_token_id,
-            {% if cookiecutter.is_encoder_decoder_model == "False" -%}
-            {% else -%}
-            is_encoder_decoder=is_encoder_decoder,
-            decoder_start_token_id=decoder_start_token_id,
-            {% endif -%}
-            **kwargs
-        )
-
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         {% if cookiecutter.is_encoder_decoder_model == "False" -%}
@@ -230,18 +222,19 @@ class {{cookiecutter.camelcase_modelname}}Config(PretrainedConfig):
         self.classifier_dropout = classifier_dropout
         self.use_cache = use_cache
         self.num_hidden_layers = encoder_layers
-        self.gradient_checkpointing = gradient_checkpointing
         self.scale_embedding = scale_embedding  # scale factor will be sqrt(d_model) if True
 
         {% endif -%}
+        super().__init__(
+            pad_token_id=pad_token_id,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            {% if cookiecutter.is_encoder_decoder_model == "False" -%}
+            {% else -%}
+            is_encoder_decoder=is_encoder_decoder,
+            decoder_start_token_id=decoder_start_token_id,
+            {% endif -%}
+            **kwargs
+        )
 
-    {% if cookiecutter.is_encoder_decoder_model == "False" %}
-    {%- else %}
-    @property
-    def num_attention_heads(self) -> int:
-        return self.encoder_attention_heads
-
-    @property
-    def hidden_size(self) -> int:
-        return self.d_model
-    {%- endif %}
+    

@@ -147,8 +147,8 @@ class TFConvBertSelfAttention(tf.keras.layers.Layer):
 
         if config.hidden_size % config.num_attention_heads != 0:
             raise ValueError(
-                "The hidden size (%d) is not a multiple of the number of attention "
-                "heads (%d)" % (config.hidden_size, config.num_attention_heads)
+                f"The hidden size ({config.hidden_size}) is not a multiple of the number of attention "
+                f"heads ({config.num_attention_heads})"
             )
 
         new_num_attention_heads = int(config.num_attention_heads / config.head_ratio)
@@ -442,7 +442,7 @@ class TFConvBertEncoder(tf.keras.layers.Layer):
     def __init__(self, config, **kwargs):
         super().__init__(**kwargs)
 
-        self.layer = [TFConvBertLayer(config, name="layer_._{}".format(i)) for i in range(config.num_hidden_layers)]
+        self.layer = [TFConvBertLayer(config, name=f"layer_._{i}") for i in range(config.num_hidden_layers)]
 
     def call(
         self,
@@ -695,7 +695,7 @@ CONVBERT_INPUTS_DOCSTRING = r"""
             Mask to avoid performing attention on padding token indices. Mask values selected in ``[0, 1]``:
 
             - 1 for tokens that are **not masked**,
-            - 0 for tokens that are **maked**.
+            - 0 for tokens that are **masked**.
 
             `What are attention masks? <../glossary.html#attention-mask>`__
         token_type_ids (:obj:`Numpy array` or :obj:`tf.Tensor` of shape :obj:`({0})`, `optional`):
@@ -739,7 +739,7 @@ CONVBERT_INPUTS_DOCSTRING = r"""
 
 
 @add_start_docstrings(
-    "The bare ConvBERT Model transformer outputing raw hidden-states without any specific head on top.",
+    "The bare ConvBERT Model transformer outputting raw hidden-states without any specific head on top.",
     CONVBERT_START_DOCSTRING,
 )
 class TFConvBertModel(TFConvBertPreTrainedModel):
@@ -970,7 +970,10 @@ class TFConvBertClassificationHead(tf.keras.layers.Layer):
         self.dense = tf.keras.layers.Dense(
             config.hidden_size, kernel_initializer=get_initializer(config.initializer_range), name="dense"
         )
-        self.dropout = tf.keras.layers.Dropout(config.hidden_dropout_prob)
+        classifier_dropout = (
+            config.classifier_dropout if config.classifier_dropout is not None else config.hidden_dropout_prob
+        )
+        self.dropout = tf.keras.layers.Dropout(classifier_dropout)
         self.out_proj = tf.keras.layers.Dense(
             config.num_labels, kernel_initializer=get_initializer(config.initializer_range), name="out_proj"
         )
@@ -1240,7 +1243,10 @@ class TFConvBertForTokenClassification(TFConvBertPreTrainedModel, TFTokenClassif
 
         self.num_labels = config.num_labels
         self.convbert = TFConvBertMainLayer(config, name="convbert")
-        self.dropout = tf.keras.layers.Dropout(config.hidden_dropout_prob)
+        classifier_dropout = (
+            config.classifier_dropout if config.classifier_dropout is not None else config.hidden_dropout_prob
+        )
+        self.dropout = tf.keras.layers.Dropout(classifier_dropout)
         self.classifier = tf.keras.layers.Dense(
             config.num_labels, kernel_initializer=get_initializer(config.initializer_range), name="classifier"
         )

@@ -16,7 +16,12 @@ import sys
 from typing import Dict
 
 from transformers import EvalPrediction, HfArgumentParser, TrainingArguments, is_torch_available
-from transformers.testing_utils import TestCasePlus, execute_subprocess_async, require_torch_multi_gpu
+from transformers.testing_utils import (
+    TestCasePlus,
+    execute_subprocess_async,
+    get_torch_dist_unique_port,
+    require_torch_multi_gpu,
+)
 from transformers.utils import logging
 
 
@@ -26,7 +31,7 @@ logger = logging.get_logger(__name__)
 if is_torch_available():
     import torch
     from torch import nn
-    from torch.utils.data.dataset import Dataset
+    from torch.utils.data import Dataset
 
     from transformers import Trainer
 
@@ -64,6 +69,7 @@ class TestTrainerDistributed(TestCasePlus):
         distributed_args = f"""
             -m torch.distributed.launch
             --nproc_per_node={torch.cuda.device_count()}
+            --master_port={get_torch_dist_unique_port()}
             {self.test_file_dir}/test_trainer_distributed.py
         """.split()
         output_dir = self.get_auto_remove_tmp_dir()
@@ -82,11 +88,8 @@ if __name__ == "__main__":
     training_args = parser.parse_args_into_dataclasses()[0]
 
     logger.warning(
-        "Process rank: %s, device: %s, n_gpu: %s, distributed training: %s",
-        training_args.local_rank,
-        training_args.device,
-        training_args.n_gpu,
-        training_args.local_rank != -1,
+        f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}, "
+        f"distributed training: {training_args.local_rank != -1}"
     )
 
     # Essentially, what we want to verify in the distributed case is that we get all samples back,
@@ -119,7 +122,7 @@ if __name__ == "__main__":
 
         p = trainer.predict(dataset)
         logger.info(p.metrics)
-        if p.metrics["eval_success"] is not True:
+        if p.metrics["test_success"] is not True:
             logger.error(p.metrics)
             exit(1)
 
@@ -133,7 +136,7 @@ if __name__ == "__main__":
 
         p = trainer.predict(dataset)
         logger.info(p.metrics)
-        if p.metrics["eval_success"] is not True:
+        if p.metrics["test_success"] is not True:
             logger.error(p.metrics)
             exit(1)
 

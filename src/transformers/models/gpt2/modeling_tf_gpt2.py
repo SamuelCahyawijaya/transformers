@@ -70,7 +70,7 @@ class TFAttention(tf.keras.layers.Layer):
         super().__init__(**kwargs)
 
         n_state = nx  # in Attention: n_state=768 (nx=n_embd)
-        # [switch nx => n_state from Block to Attention to keep identical to TF implem]
+        # [switch nx => n_state from Block to Attention to keep identical to TF implementation]
         assert n_state % config.n_head == 0
         self.n_ctx = n_ctx
         self.n_head = config.n_head
@@ -174,7 +174,7 @@ class TFMLP(tf.keras.layers.Layer):
         nx = config.n_embd
         self.c_fc = TFConv1D(n_state, nx, initializer_range=config.initializer_range, name="c_fc")
         self.c_proj = TFConv1D(nx, n_state, initializer_range=config.initializer_range, name="c_proj")
-        self.act = get_tf_activation("gelu")
+        self.act = get_tf_activation(config.activation_function)
         self.dropout = tf.keras.layers.Dropout(config.resid_pdrop)
 
     def call(self, x, training=False):
@@ -233,7 +233,7 @@ class TFGPT2MainLayer(tf.keras.layers.Layer):
             config.vocab_size, config.hidden_size, initializer_range=config.initializer_range, name="wte"
         )
         self.drop = tf.keras.layers.Dropout(config.embd_pdrop)
-        self.h = [TFBlock(config.n_ctx, config, scale=True, name="h_._{}".format(i)) for i in range(config.n_layer)]
+        self.h = [TFBlock(config.n_ctx, config, scale=True, name=f"h_._{i}") for i in range(config.n_layer)]
         self.ln_f = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_epsilon, name="ln_f")
 
     def build(self, input_shape):

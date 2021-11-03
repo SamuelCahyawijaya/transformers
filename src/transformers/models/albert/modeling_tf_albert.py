@@ -189,7 +189,7 @@ class TFAlbertEmbeddings(tf.keras.layers.Layer):
 
 
 class TFAlbertAttention(tf.keras.layers.Layer):
-    """ Contains the complete attention sublayer, including both dropouts and layer norm. """
+    """Contains the complete attention sublayer, including both dropouts and layer norm."""
 
     def __init__(self, config: AlbertConfig, **kwargs):
         super().__init__(**kwargs)
@@ -338,7 +338,7 @@ class TFAlbertLayerGroup(tf.keras.layers.Layer):
         super().__init__(**kwargs)
 
         self.albert_layers = [
-            TFAlbertLayer(config, name="albert_layers_._{}".format(i)) for i in range(config.inner_group_num)
+            TFAlbertLayer(config, name=f"albert_layers_._{i}") for i in range(config.inner_group_num)
         ]
 
     def call(
@@ -390,8 +390,7 @@ class TFAlbertTransformer(tf.keras.layers.Layer):
             name="embedding_hidden_mapping_in",
         )
         self.albert_layer_groups = [
-            TFAlbertLayerGroup(config, name="albert_layer_groups_._{}".format(i))
-            for i in range(config.num_hidden_groups)
+            TFAlbertLayerGroup(config, name=f"albert_layer_groups_._{i}") for i in range(config.num_hidden_groups)
         ]
 
     def call(
@@ -1200,7 +1199,12 @@ class TFAlbertForTokenClassification(TFAlbertPreTrainedModel, TFTokenClassificat
         self.num_labels = config.num_labels
 
         self.albert = TFAlbertMainLayer(config, add_pooling_layer=False, name="albert")
-        self.dropout = tf.keras.layers.Dropout(rate=config.hidden_dropout_prob)
+        classifier_dropout_prob = (
+            config.classifier_dropout_prob
+            if config.classifier_dropout_prob is not None
+            else config.hidden_dropout_prob
+        )
+        self.dropout = tf.keras.layers.Dropout(rate=classifier_dropout_prob)
         self.classifier = tf.keras.layers.Dense(
             units=config.num_labels, kernel_initializer=get_initializer(config.initializer_range), name="classifier"
         )

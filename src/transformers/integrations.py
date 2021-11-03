@@ -14,19 +14,16 @@
 """
 Integrations with other Python libraries.
 """
+import functools
 import importlib.util
-import io
-import json
 import numbers
 import os
-import re
+import sys
 import tempfile
 from pathlib import Path
-from types import SimpleNamespace
 
-from .trainer_utils import SchedulerType
+from .file_utils import is_datasets_available
 from .utils import logging
-from .utils.versions import require_version
 
 
 logger = logging.get_logger(__name__)
@@ -48,7 +45,7 @@ if _has_comet:
         _has_comet = False
 
 from .file_utils import ENV_VARS_TRUE_VALUES, is_torch_tpu_available  # noqa: E402
-from .trainer_callback import TrainerCallback  # noqa: E402
+from .trainer_callback import ProgressCallback, TrainerCallback  # noqa: E402
 from .trainer_utils import PREFIX_CHECKPOINT_DIR, BestRun, IntervalStrategy  # noqa: E402
 
 
@@ -56,7 +53,7 @@ from .trainer_utils import PREFIX_CHECKPOINT_DIR, BestRun, IntervalStrategy  # n
 def is_wandb_available():
     # any value of WANDB_DISABLED disables wandb
     if os.getenv("WANDB_DISABLED", "").upper() in ENV_VARS_TRUE_VALUES:
-        logger.warn(
+        logger.warning(
             "Using the `WAND_DISABLED` environment variable is deprecated and will be removed in v5. Use the "
             "--report_to flag to control the integrations used for logging result (for instance --report_to none)."
         )
@@ -86,6 +83,10 @@ def is_ray_tune_available():
     return importlib.util.find_spec("ray.tune") is not None
 
 
+def is_sigopt_available():
+    return importlib.util.find_spec("sigopt") is not None
+
+
 def is_azureml_available():
     if importlib.util.find_spec("azureml") is None:
         return False
@@ -102,8 +103,12 @@ def is_fairscale_available():
     return importlib.util.find_spec("fairscale") is not None
 
 
-def is_deepspeed_available():
-    return importlib.util.find_spec("deepspeed") is not None
+def is_neptune_available():
+    return importlib.util.find_spec("neptune") is not None
+
+
+def is_codecarbon_available():
+    return importlib.util.find_spec("codecarbon") is not None
 
 
 def hp_params(trial):
@@ -116,6 +121,10 @@ def hp_params(trial):
         if isinstance(trial, dict):
             return trial
 
+    if is_sigopt_available():
+        if isinstance(trial, dict):
+            return trial
+
     raise RuntimeError(f"Unknown type for trial {trial.__class__}")
 
 
@@ -124,6 +133,8 @@ def default_hp_search_backend():
         return "optuna"
     elif is_ray_tune_available():
         return "ray"
+    elif is_sigopt_available():
+        return "sigopt"
 
 
 def run_hp_search_optuna(trainer, n_trials: int, direction: str, **kwargs) -> BestRun:
@@ -155,6 +166,14 @@ def run_hp_search_ray(trainer, n_trials: int, direction: str, **kwargs) -> BestR
     import ray
 
     def _objective(trial, local_trainer, checkpoint_dir=None):
+        try:
+            from transformers.utils.notebook import NotebookProgressCallback
+
+            if local_trainer.pop_callback(NotebookProgressCallback):
+                local_trainer.add_callback(ProgressCallback)
+        except ModuleNotFoundError:
+            pass
+
         checkpoint = None
         if checkpoint_dir:
             for subdir in os.listdir(checkpoint_dir):
@@ -169,11 +188,21 @@ def run_hp_search_ray(trainer, n_trials: int, direction: str, **kwargs) -> BestR
             local_trainer._tune_save_checkpoint()
             ray.tune.report(objective=local_trainer.objective, **metrics, done=True)
 
+    if not trainer._memory_tracker.skip_memory_metrics:
+        from .trainer_utils import TrainerMemoryTracker
+
+        logger.warning(
+            "Memory tracking for your Trainer is currently "
+            "enabled. Automatically disabling the memory tracker "
+            "since the memory tracker is not serializable."
+        )
+        trainer._memory_tracker = TrainerMemoryTracker(skip_memory_metrics=True)
+
     # The model and TensorBoard writer do not pickle so we have to remove them (if they exists)
     # while doing the ray hp search.
-
     _tb_writer = trainer.pop_callback(TensorBoardCallback)
     trainer.model = None
+
     # Setup default `resources_per_trial`.
     if "resources_per_trial" not in kwargs:
         # Default to 1 CPU and 1 GPU (if applicable) per trial.
@@ -200,7 +229,7 @@ def run_hp_search_ray(trainer, n_trials: int, direction: str, **kwargs) -> BestR
         trainer.use_tune_checkpoints = True
         if kwargs["keep_checkpoints_num"] > 1:
             logger.warning(
-                f"Currently keeping {kwargs['keep_checkpoint_num']} checkpoints for each trial. "
+                f"Currently keeping {kwargs['keep_checkpoints_num']} checkpoints for each trial. "
                 "Checkpoints are usually huge, "
                 "consider setting `keep_checkpoints_num=1`."
             )
@@ -230,8 +259,34 @@ def run_hp_search_ray(trainer, n_trials: int, direction: str, **kwargs) -> BestR
                 "Trainer `args`.".format(cls=type(kwargs["scheduler"]).__name__)
             )
 
+    trainable = ray.tune.with_parameters(_objective, local_trainer=trainer)
+
+    @functools.wraps(trainable)
+    def dynamic_modules_import_trainable(*args, **kwargs):
+        """
+        Wrapper around ``tune.with_parameters`` to ensure datasets_modules are loaded on each Actor.
+
+        Without this, an ImportError will be thrown. See https://github.com/huggingface/transformers/issues/11565.
+
+        Assumes that ``_objective``, defined above, is a function.
+        """
+        if is_datasets_available():
+            import datasets.load
+
+            dynamic_modules_path = os.path.join(datasets.load.init_dynamic_modules(), "__init__.py")
+            # load dynamic_modules from path
+            spec = importlib.util.spec_from_file_location("datasets_modules", dynamic_modules_path)
+            datasets_modules = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = datasets_modules
+            spec.loader.exec_module(datasets_modules)
+        return trainable(*args, **kwargs)
+
+    # special attr set by tune.with_parameters
+    if hasattr(trainable, "__mixins__"):
+        dynamic_modules_import_trainable.__mixins__ = trainable.__mixins__
+
     analysis = ray.tune.run(
-        ray.tune.with_parameters(_objective, local_trainer=trainer),
+        dynamic_modules_import_trainable,
         config=trainer.hp_space(None),
         num_samples=n_trials,
         **kwargs,
@@ -240,6 +295,45 @@ def run_hp_search_ray(trainer, n_trials: int, direction: str, **kwargs) -> BestR
     best_run = BestRun(best_trial.trial_id, best_trial.last_result["objective"], best_trial.config)
     if _tb_writer is not None:
         trainer.add_callback(_tb_writer)
+    return best_run
+
+
+def run_hp_search_sigopt(trainer, n_trials: int, direction: str, **kwargs) -> BestRun:
+
+    from sigopt import Connection
+
+    conn = Connection()
+    proxies = kwargs.pop("proxies", None)
+    if proxies is not None:
+        conn.set_proxies(proxies)
+
+    experiment = conn.experiments().create(
+        name="huggingface-tune",
+        parameters=trainer.hp_space(None),
+        metrics=[dict(name="objective", objective=direction, strategy="optimize")],
+        parallel_bandwidth=1,
+        observation_budget=n_trials,
+        project="huggingface",
+    )
+    logger.info(f"created experiment: https://app.sigopt.com/experiment/{experiment.id}")
+
+    while experiment.progress.observation_count < experiment.observation_budget:
+        suggestion = conn.experiments(experiment.id).suggestions().create()
+        trainer.objective = None
+        trainer.train(resume_from_checkpoint=None, trial=suggestion)
+        # If there hasn't been any evaluation during the training loop.
+        if getattr(trainer, "objective", None) is None:
+            metrics = trainer.evaluate()
+            trainer.objective = trainer.compute_objective(metrics)
+
+        values = [dict(name="objective", value=trainer.objective)]
+        obs = conn.experiments(experiment.id).observations().create(suggestion=suggestion.id, values=values)
+        logger.info(f"[suggestion_id, observation_id]: [{suggestion.id}, {obs.id}]")
+        experiment = conn.experiments(experiment.id).fetch()
+
+    best = list(conn.experiments(experiment.id).best_assignments().fetch().iterate_pages())[0]
+    best_run = BestRun(best.id, best.value, best.assignments)
+
     return best_run
 
 
@@ -255,6 +349,8 @@ def get_available_reporting_integrations():
         integrations.append("tensorboard")
     if is_wandb_available():
         integrations.append("wandb")
+    if is_codecarbon_available():
+        integrations.append("codecarbon")
     return integrations
 
 
@@ -268,157 +364,6 @@ def rewrite_logs(d):
         else:
             new_d["train/" + k] = v
     return new_d
-
-
-def init_deepspeed(trainer, num_training_steps):
-    """
-    Init DeepSpeed, after converting any relevant Trainer's args into DeepSpeed configuration
-
-    Args:
-        trainer: Trainer object
-        num_training_steps: per single gpu
-
-    Returns: model, optimizer, lr_scheduler
-    """
-    import deepspeed
-
-    require_version("deepspeed>0.3.10")
-
-    args = trainer.args
-    ds_config_file = args.deepspeed
-    model = trainer.model
-
-    with io.open(ds_config_file, "r", encoding="utf-8") as f:
-        config = json.load(f)
-
-    # The following code translates relevant trainer's cl args into the DS config
-
-    # First to ensure that there is no mismatch between cl args values and presets in the config
-    # file, ask to not set in ds config file:
-    # - "train_batch_size",
-    # - "train_micro_batch_size_per_gpu",
-    # - "gradient_accumulation_steps"
-    bs_keys = ["train_batch_size", "train_micro_batch_size_per_gpu"]
-    if len([x for x in bs_keys if x in config.keys()]):
-        raise ValueError(
-            f"Do not include {bs_keys} entries in the ds config file, as they will be set via --per_device_train_batch_size or its default"
-        )
-    if "gradient_accumulation_steps" in config.keys():
-        raise ValueError(
-            "Do not include gradient_accumulation_steps entries in the ds config file, as they will be set via --gradient_accumulation_steps or its default"
-        )
-
-    # DeepSpeed does:
-    #   train_batch_size = n_gpus * train_micro_batch_size_per_gpu * gradient_accumulation_steps
-    # therefore we just need to set:
-    config["train_micro_batch_size_per_gpu"] = args.per_device_train_batch_size
-    config["gradient_accumulation_steps"] = args.gradient_accumulation_steps
-
-    if "gradient_clipping" in config:
-        logger.info(
-            f"Keeping the `gradient_clipping` config from {ds_config_file} intact, ignoring any gradient clipping-specific cl args"
-        )
-    else:  # override only if the ds config doesn't already have this section
-        config["gradient_clipping"] = args.max_grad_norm
-
-    if "optimizer" in config:
-        logger.info(
-            f"Keeping the `optimizer` config from {ds_config_file} intact, ignoring any optimizer-specific cl args"
-        )
-    else:  # override only if the ds config doesn't already have this section
-        # ds supports Adam, AdamW, OneBitAdam, and Lamb optimizers and can import other optimizers from torch.
-        # To use other optimizers requires voiding warranty with: `"zero_allow_untested_optimizer": true"`
-
-        optimizer_configs = {
-            "AdamW": {
-                "lr": args.learning_rate,
-                "betas": [args.adam_beta1, args.adam_beta2],
-                "eps": args.adam_epsilon,
-                "weight_decay": args.weight_decay,
-            }
-        }
-        optimizer = "AdamW"
-
-        config["optimizer"] = {
-            "type": optimizer,
-            "params": optimizer_configs[optimizer],
-        }
-
-    # DS schedulers (deepspeed/runtime/lr_schedules.py):
-    #
-    # DS name      | --lr_scheduler_type  | HF func                           | Notes
-    # -------------| ---------------------|-----------------------------------|--------------------
-    # LRRangeTest  | na                   | na                                | LRRT
-    # OneCycle     | na                   | na                                | 1CLR
-    # WarmupLR     | constant_with_warmup | get_constant_schedule_with_warmup | w/ warmup_min_lr=0
-    # WarmupDecayLR| linear               | get_linear_schedule_with_warmup   |
-    if "scheduler" in config:
-        logger.info(
-            f"Keeping the `scheduler` config from {ds_config_file} intact, ignoring any scheduler-specific cl args"
-        )
-    else:  # override only if the ds config doesn't already have this section
-        if args.lr_scheduler_type == SchedulerType.LINEAR:
-            scheduler = "WarmupDecayLR"
-            params = {
-                "last_batch_iteration": -1,
-                "total_num_steps": num_training_steps,
-                "warmup_min_lr": 0,
-                "warmup_max_lr": args.learning_rate,
-                "warmup_num_steps": args.warmup_steps,
-            }
-        elif args.lr_scheduler_type == SchedulerType.CONSTANT_WITH_WARMUP:
-            scheduler = "WarmupLR"
-            params = {
-                "warmup_min_lr": 0,
-                "warmup_max_lr": args.learning_rate,
-                "warmup_num_steps": args.warmup_steps,
-            }
-        else:
-            raise ValueError(f"{args.lr_scheduler_type} scheduler type is not supported by DeepSpeed")
-
-        config["scheduler"] = {
-            "type": scheduler,
-            "params": params,
-        }
-
-    # fp16
-    if trainer.fp16_backend is not None:
-        # Deepspeed has 2 possible fp16 config entries:
-        # - `fp16`: for the native amp - it has a bunch of optional params but we won't set any here unless the user did the work
-        # - `amp`: which delegates amp work to apex (which needs to be available), but it cannot be used with any ZeRO features, so probably best to be avoided.
-        if trainer.fp16_backend == "apex":
-            if "amp" in config:
-                logger.info(
-                    f"Keeping the `amp` config from {ds_config_file} intact, ignoring any amp-specific cl args"
-                )
-            else:
-                config["amp"] = {
-                    "enabled": True,
-                    "opt_level": args.fp16_opt_level,
-                }
-        elif trainer.fp16_backend == "amp":
-            if "fp16" in config:
-                logger.info(
-                    f"Keeping the `fp16` config from {ds_config_file} intact, ignoring any fp16-specific cl args"
-                )
-            else:
-                config["fp16"] = {
-                    "enabled": True,
-                }
-
-    # for clarity extract the specific cl args that are being passed to deepspeed
-    ds_args = dict(local_rank=args.local_rank)
-
-    # init that takes part of the config via `args`, and the bulk of it via `config_params`
-    model_parameters = filter(lambda p: p.requires_grad, model.parameters())
-    model, optimizer, _, lr_scheduler = deepspeed.initialize(
-        args=SimpleNamespace(**ds_args),  # expects an obj
-        model=model,
-        model_parameters=model_parameters,
-        config_params=config,
-    )
-
-    return model, optimizer, lr_scheduler
 
 
 class TensorBoardCallback(TrainerCallback):
@@ -468,7 +413,8 @@ class TensorBoardCallback(TrainerCallback):
             if trial_name is not None:
                 log_dir = os.path.join(args.logging_dir, trial_name)
 
-        self._init_summary_writer(args, log_dir)
+        if self.tb_writer is None:
+            self._init_summary_writer(args, log_dir)
 
         if self.tb_writer is not None:
             self.tb_writer.add_text("args", args.to_json_string())
@@ -482,9 +428,11 @@ class TensorBoardCallback(TrainerCallback):
                 self.tb_writer.add_hparams(args.to_sanitized_dict(), metric_dict={})
 
     def on_log(self, args, state, control, logs=None, **kwargs):
-        if state.is_world_process_zero:
-            if self.tb_writer is None:
-                self._init_summary_writer(args)
+        if not state.is_world_process_zero:
+            return
+
+        if self.tb_writer is None:
+            self._init_summary_writer(args)
 
         if self.tb_writer is not None:
             logs = rewrite_logs(logs)
@@ -494,18 +442,16 @@ class TensorBoardCallback(TrainerCallback):
                 else:
                     logger.warning(
                         "Trainer is attempting to log a value of "
-                        '"%s" of type %s for key "%s" as a scalar. '
+                        f'"{v}" of type {type(v)} for key "{k}" as a scalar. '
                         "This invocation of Tensorboard's writer.add_scalar() "
-                        "is incorrect so we dropped this attribute.",
-                        v,
-                        type(v),
-                        k,
+                        "is incorrect so we dropped this attribute."
                     )
             self.tb_writer.flush()
 
     def on_train_end(self, args, state, control, **kwargs):
         if self.tb_writer:
             self.tb_writer.close()
+            self.tb_writer = None
 
 
 class WandbCallback(TrainerCallback):
@@ -519,20 +465,12 @@ class WandbCallback(TrainerCallback):
         if has_wandb:
             import wandb
 
-            wandb.ensure_configured()
-            if wandb.api.api_key is None:
-                has_wandb = False
-                logger.warning(
-                    "W&B installed but not logged in. Run `wandb login` or set the WANDB_API_KEY env variable."
-                )
-                self._wandb = None
-            else:
-                self._wandb = wandb
+            self._wandb = wandb
         self._initialized = False
         # log outputs
         self._log_model = os.getenv("WANDB_LOG_MODEL", "FALSE").upper() in ENV_VARS_TRUE_VALUES.union({"TRUE"})
 
-    def setup(self, args, state, model, reinit, **kwargs):
+    def setup(self, args, state, model, **kwargs):
         """
         Setup the optional Weights & Biases (`wandb`) integration.
 
@@ -541,7 +479,8 @@ class WandbCallback(TrainerCallback):
 
         Environment:
             WANDB_LOG_MODEL (:obj:`bool`, `optional`, defaults to :obj:`False`):
-                Whether or not to log model as artifact at the end of training.
+                Whether or not to log model as artifact at the end of training. Use along with
+                `TrainingArguments.load_best_model_at_end` to upload best model.
             WANDB_WATCH (:obj:`str`, `optional` defaults to :obj:`"gradients"`):
                 Can be :obj:`"gradients"`, :obj:`"all"` or :obj:`"false"`. Set to :obj:`"false"` to disable gradient
                 logging or :obj:`"all"` to log gradients and parameters.
@@ -570,13 +509,19 @@ class WandbCallback(TrainerCallback):
             else:
                 run_name = args.run_name
 
-            self._wandb.init(
-                project=os.getenv("WANDB_PROJECT", "huggingface"),
-                config=combined_dict,
-                name=run_name,
-                reinit=reinit,
-                **init_args,
-            )
+            if self._wandb.run is None:
+                self._wandb.init(
+                    project=os.getenv("WANDB_PROJECT", "huggingface"),
+                    name=run_name,
+                    **init_args,
+                )
+            # add config parameters (run may have been created manually)
+            self._wandb.config.update(combined_dict, allow_val_change=True)
+
+            # define default x-axis (for latest wandb versions)
+            if getattr(self._wandb, "define_metric", None):
+                self._wandb.define_metric("train/global_step")
+                self._wandb.define_metric("*", step_metric="train/global_step", step_sync=True)
 
             # keep track of model topology and gradients, unsupported on TPU
             if not is_torch_tpu_available() and os.getenv("WANDB_WATCH") != "false":
@@ -588,23 +533,21 @@ class WandbCallback(TrainerCallback):
         if self._wandb is None:
             return
         hp_search = state.is_hyper_param_search
-        if not self._initialized or hp_search:
-            self.setup(args, state, model, reinit=hp_search, **kwargs)
+        if hp_search:
+            self._wandb.finish()
+            self._initialized = False
+        if not self._initialized:
+            self.setup(args, state, model, **kwargs)
 
     def on_train_end(self, args, state, control, model=None, tokenizer=None, **kwargs):
         if self._wandb is None:
             return
-        # commit last step
-        if state.is_world_process_zero:
-            self._wandb.log({})
         if self._log_model and self._initialized and state.is_world_process_zero:
             from .trainer import Trainer
 
             fake_trainer = Trainer(args=args, model=model, tokenizer=tokenizer)
             with tempfile.TemporaryDirectory() as temp_dir:
                 fake_trainer.save_model(temp_dir)
-                # use run name and ensure it's a valid Artifact name
-                artifact_name = re.sub(r"[^a-zA-Z0-9_\.\-]", "", self._wandb.run.name)
                 metadata = (
                     {
                         k: v
@@ -617,7 +560,7 @@ class WandbCallback(TrainerCallback):
                         "train/total_floss": state.total_flos,
                     }
                 )
-                artifact = self._wandb.Artifact(name=f"run-{artifact_name}", type="model", metadata=metadata)
+                artifact = self._wandb.Artifact(name=f"model-{self._wandb.run.id}", type="model", metadata=metadata)
                 for f in Path(temp_dir).glob("*"):
                     if f.is_file():
                         with artifact.new_file(f.name, mode="wb") as fa:
@@ -628,10 +571,10 @@ class WandbCallback(TrainerCallback):
         if self._wandb is None:
             return
         if not self._initialized:
-            self.setup(args, state, model, reinit=False)
+            self.setup(args, state, model)
         if state.is_world_process_zero:
             logs = rewrite_logs(logs)
-            self._wandb.log(logs, step=state.global_step)
+            self._wandb.log({**logs, "train/global_step": state.global_step})
 
 
 class CometCallback(TrainerCallback):
@@ -708,7 +651,7 @@ class AzureMLCallback(TrainerCallback):
             self.azureml_run = Run.get_context()
 
     def on_log(self, args, state, control, logs=None, **kwargs):
-        if self.azureml_run:
+        if self.azureml_run and state.is_world_process_zero:
             for k, v in logs.items():
                 if isinstance(v, (int, float)):
                     self.azureml_run.log(k, v, description=k)
@@ -739,8 +682,8 @@ class MLflowCallback(TrainerCallback):
                 Whether to use MLflow .log_artifact() facility to log artifacts.
 
                 This only makes sense if logging to a remote server, e.g. s3 or GCS. If set to `True` or `1`, will copy
-                whatever is in TrainerArgument's output_dir to the local or remote artifact storage. Using it without a
-                remote storage will just copy the files to your artifact location.
+                whatever is in :class:`~transformers.TrainingArguments`'s ``output_dir`` to the local or remote
+                artifact storage. Using it without a remote storage will just copy the files to your artifact location.
         """
         log_artifacts = os.getenv("HF_MLFLOW_LOG_ARTIFACTS", "FALSE").upper()
         if log_artifacts in {"TRUE", "1"}:
@@ -800,12 +743,112 @@ class MLflowCallback(TrainerCallback):
             self._ml_flow.end_run()
 
 
+class NeptuneCallback(TrainerCallback):
+    """
+    A :class:`~transformers.TrainerCallback` that sends the logs to `Neptune <https://neptune.ai>`.
+    """
+
+    def __init__(self):
+        assert (
+            is_neptune_available()
+        ), "NeptuneCallback requires neptune-client to be installed. Run `pip install neptune-client`."
+        import neptune.new as neptune
+
+        self._neptune = neptune
+        self._initialized = False
+        self._log_artifacts = False
+
+    def setup(self, args, state, model):
+        """
+        Setup the Neptune integration.
+
+        Environment:
+            NEPTUNE_PROJECT (:obj:`str`, `required`):
+                The project ID for neptune.ai account. Should be in format `workspace_name/project_name`
+            NEPTUNE_API_TOKEN (:obj:`str`, `required`):
+                API-token for neptune.ai account
+            NEPTUNE_CONNECTION_MODE (:obj:`str`, `optional`):
+                Neptune connection mode. `async` by default
+            NEPTUNE_RUN_NAME (:obj:`str`, `optional`):
+                The name of run process on Neptune dashboard
+        """
+        if state.is_world_process_zero:
+            self._neptune_run = self._neptune.init(
+                project=os.getenv("NEPTUNE_PROJECT"),
+                api_token=os.getenv("NEPTUNE_API_TOKEN"),
+                mode=os.getenv("NEPTUNE_CONNECTION_MODE", "async"),
+                name=os.getenv("NEPTUNE_RUN_NAME", None),
+                run=os.getenv("NEPTUNE_RUN_ID", None),
+            )
+            combined_dict = args.to_dict()
+            if hasattr(model, "config") and model.config is not None:
+                model_config = model.config.to_dict()
+                combined_dict = {**model_config, **combined_dict}
+            self._neptune_run["parameters"] = combined_dict
+        self._initialized = True
+
+    def on_train_begin(self, args, state, control, model=None, **kwargs):
+        if not self._initialized:
+            self.setup(args, state, model)
+
+    def on_log(self, args, state, control, logs, model=None, **kwargs):
+        if not self._initialized:
+            self.setup(args, state, model)
+        if state.is_world_process_zero:
+            for k, v in logs.items():
+                self._neptune_run[k].log(v, step=state.global_step)
+
+    def __del__(self):
+        """
+        Environment:
+            NEPTUNE_STOP_TIMEOUT (:obj:`int`, `optional`):
+                Number of seconsds to wait for all Neptune.ai tracking calls to finish, before stopping the tracked
+                run. If not set it will wait for all tracking calls to finish.
+        """
+        try:
+            stop_timeout = os.getenv("NEPTUNE_STOP_TIMEOUT")
+            stop_timeout = int(stop_timeout) if stop_timeout else None
+            self._neptune_run.stop(seconds=stop_timeout)
+        except AttributeError:
+            pass
+
+
+class CodeCarbonCallback(TrainerCallback):
+    """
+    A :class:`~transformers.TrainerCallback` that tracks the CO2 emission of training.
+    """
+
+    def __init__(self):
+        assert (
+            is_codecarbon_available()
+        ), "CodeCarbonCallback requires `codecarbon` to be installed. Run `pip install codecarbon`."
+        import codecarbon
+
+        self._codecarbon = codecarbon
+        self.tracker = None
+
+    def on_init_end(self, args, state, control, **kwargs):
+        if self.tracker is None and state.is_local_process_zero:
+            # CodeCarbon will automatically handle environment variables for configuration
+            self.tracker = self._codecarbon.EmissionsTracker(output_dir=args.output_dir)
+
+    def on_train_begin(self, args, state, control, model=None, **kwargs):
+        if self.tracker and state.is_local_process_zero:
+            self.tracker.start()
+
+    def on_train_end(self, args, state, control, **kwargs):
+        if self.tracker and state.is_local_process_zero:
+            self.tracker.stop()
+
+
 INTEGRATION_TO_CALLBACK = {
     "azure_ml": AzureMLCallback,
     "comet_ml": CometCallback,
     "mlflow": MLflowCallback,
+    "neptune": NeptuneCallback,
     "tensorboard": TensorBoardCallback,
     "wandb": WandbCallback,
+    "codecarbon": CodeCarbonCallback,
 }
 
 
